@@ -1,0 +1,401 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// -------------------------------------------------------------
+// ENUMS DE DOMÍNIO
+// -------------------------------------------------------------
+
+enum SexoBiologico {
+  MASCULINO
+  FEMININO
+  INDETERMINADO
+}
+
+enum StatusAtendimento {
+  REGISTRADO
+  AGUARDANDO_COLETA
+  EM_PROCESSAMENTO
+  PARCIALMENTE_LIBERADO
+  CONCLUIDO
+  CANCELADO
+}
+
+enum StatusAmostra {
+  PENDENTE_COLETA
+  COLETADA
+  EM_TRIAGEM
+  APROVADA_TRIAGEM
+  INVALIDADA_RECOLETA
+  EM_ANALISE_INTERNA
+  AGUARDANDO_ENVIO_APOIO
+  ENVIADA_APOIO
+  RESULTADO_RECEBIDO_APOIO
+  ANALISADA
+  LAUDADA_LIBERADA
+  ARQUIVADA_SOROTECA
+  DESCARTADA
+}
+
+enum MotivoRejeicaoAmostra {
+  HEMOLISE
+  COAGULACAO
+  VOLUME_INSUFICIENTE
+  LIPEMIA_ACENTUADA
+  TUBO_INADEQUADO
+  IDENTIFICACAO_ILEGIVEL
+  MATERIAL_EXTRAVIADO
+}
+
+enum StatusSlaRemessa {
+  NO_PRAZO
+  ALERTA_PROXIMIDADE
+  ATRASADO
+  CONCLUIDO
+}
+
+enum StatusNotificacao {
+  PENDENTE
+  ENVIADA
+  FALHA_ENVIO
+  CONFIRMADA_LEITURA
+}
+
+enum PerfilUsuario {
+  ADMIN
+  RECEPCAO
+  COLETADOR
+  ANALISTA_BIOMEDICO
+  RESPONSAVEL_TECNICO
+}
+
+// -------------------------------------------------------------
+// USUÁRIOS E SEGURANÇA
+// -------------------------------------------------------------
+
+model Usuario {
+  id               String         @id @default(uuid())
+  nome             String
+  email            String         @unique
+  senhaHash        String
+  perfil           PerfilUsuario
+  registroConselho String?        // CRBM, CRF, CRM
+  ativo            Boolean        @default(true)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  atendimentosCriados Atendimento[]     @relation("UsuarioAtendimento")
+  coletasEfetuadas    Amostra[]         @relation("UsuarioColetador")
+  triagensEfetuadas   Amostra[]         @relation("UsuarioTriador")
+  laudosLiberados     ItemAtendimento[] @relation("UsuarioLiberador")
+
+  @@map("usuarios")
+}
+
+// -------------------------------------------------------------
+// PACIENTE
+// -------------------------------------------------------------
+
+model Paciente {
+  id                 String        @id @default(uuid())
+  nomeCompleto       String
+  cpf                String        @unique
+  dataNascimento     DateTime
+  sexoBiologico      SexoBiologico
+  telefoneWhatsapp   String        // Validação E.164 obrigatória (ex: +5511999998888)
+  email              String?
+  restricoesAlergias String?
+  observacoes        String?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  atendimentos       Atendimento[]
+
+  @@map("pacientes")
+}
+
+// -------------------------------------------------------------
+// INTELIGÊNCIA PRÉ-ANALÍTICA: TUBOS E EXAMES
+// -------------------------------------------------------------
+
+model TuboColeta {
+  id                       String   @id @default(uuid())
+  codigo                   String   @unique // ex: "EDTA_ROXO", "CITRATO_AZUL", "SORO_GEL_AMARELO"
+  descricao                String   // ex: "Tubo Tampa Roxa - K2/K3 EDTA 4ml"
+  corTampaHex              String   // ex: "#8E44AD" (Roxo) para UI
+  aditivoAnticoagulante     String   // ex: "EDTA K3", "Citrato de Sódio 3.2%", "Fluoreto/Oxalato"
+  volumeMinimoMl           Decimal  @db.Decimal(4, 2)
+  ordemColetaRecomendada   Int      // Padrão CLSI H3-A6: 1 (Azul), 2 (Amarelo/Vermelho), 3 (Verde), 4 (Roxo), 5 (Cinza)
+  instrucoesHomogeneizacao String   // ex: "Inverter suavemente de 8 a 10 vezes"
+  ativo                    Boolean  @default(true)
+
+  examesPermitidos         Exame[]  @relation("TuboPrincipalExame")
+  amostrasGeradas          Amostra[]
+
+  @@map("tubos_coleta")
+}
+
+model Exame {
+  id                       String            @id @default(uuid())
+  codigo                   String?           @unique
+  nome                     String
+  categoria                String?
+  material                 String?
+  preco                    Decimal?          @db.Decimal(10, 2)
+  
+  mnemonico                String?           @unique // ex: "HEMO", "GLI", "COAG", "TSH"
+  codigoTUSS               String?
+  setorLaboratorial        String?           // ex: "Hematologia", "Bioquímica", "Sorologia"
+  tempoJejumHoras          Int               @default(0)
+  orientacoesPreparo       String?
+  prazoDiasUteis           Int               @default(1)
+  precoBaseReais           Decimal?          @db.Decimal(10, 2) // Preço padrão para orçamentos rápidos
+  
+  // Relação Pré-Analítica Obrigatória com o Tubo
+  tuboColetaId             String?
+  tuboColeta               TuboColeta?       @relation("TuboPrincipalExame", fields: [tuboColetaId], references: [id])
+  
+  // Regra de Terceirização / Laboratório de Apoio
+  requerApoioExterno       Boolean           @default(false)
+  laboratorioApoioPadraoId String?
+  laboratorioApoioPadrao   LaboratorioApoio? @relation(fields: [laboratorioApoioPadraoId], references: [id])
+
+  itensAtendimentos        ItemAtendimento[]
+  consumosReagentes        ConsumoReagente[]
+
+  @@map("exames")
+}
+
+// -------------------------------------------------------------
+// ATENDIMENTO (ORDEM DE SERVIÇO / PROTOCOLO)
+// -------------------------------------------------------------
+
+model Atendimento {
+  id                String            @id @default(uuid())
+  codigoProtocolo   String            @unique // ex: "ATD-2026-000452"
+  pacienteId        String
+  paciente          Paciente          @relation(fields: [pacienteId], references: [id])
+  usuarioRegistroId String
+  usuarioRegistro   Usuario           @relation("UsuarioAtendimento", fields: [usuarioRegistroId], references: [id])
+  
+  medicoSolicitante String?
+  crmMedico         String?
+  status            StatusAtendimento @default(REGISTRADO)
+  dataHoraEntrada   DateTime          @default(now())
+  observacoes       String?
+  
+  amostras          Amostra[]
+  itens             ItemAtendimento[]
+
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  @@map("atendimentos")
+}
+
+// -------------------------------------------------------------
+// AMOSTRA (TUBO FÍSICO COM CÓDIGO DE BARRAS)
+// -------------------------------------------------------------
+
+model Amostra {
+  id                  String              @id @default(uuid())
+  codigoBarras        String              @unique // ex: "AMO-20261001-99881"
+  atendimentoId       String
+  atendimento         Atendimento         @relation(fields: [atendimentoId], references: [id])
+  
+  tuboColetaId        String
+  tuboColeta          TuboColeta          @relation(fields: [tuboColetaId], references: [id])
+  
+  status              StatusAmostra       @default(PENDENTE_COLETA)
+  
+  // Metadados de Coleta
+  dataHoraColeta      DateTime?
+  coletadorId         String?
+  coletador           Usuario?            @relation("UsuarioColetador", fields: [coletadorId], references: [id])
+  
+  // Metadados de Triagem
+  dataHoraTriagem     DateTime?
+  triadorId           String?
+  triador             Usuario?            @relation("UsuarioTriador", fields: [triadorId], references: [id])
+  
+  // Rastreabilidade de Recoleta
+  isRecoleta          Boolean             @default(false)
+  amostraOriginalId   String?
+  amostraOriginal     Amostra?            @relation("HistoricoRecoleta", fields: [amostraOriginalId], references: [id])
+  amostrasSubstitutas Amostra[]           @relation("HistoricoRecoleta")
+  
+  // Rastreabilidade B2B
+  itemRemessaApoio    ItemRemessaApoio?
+  ocorrencias         OcorrenciaAmostra[]
+  itensExames         ItemAtendimento[]
+
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  @@map("amostras")
+}
+
+// -------------------------------------------------------------
+// ITEM DO ATENDIMENTO (ASSOCIAÇÃO EXAME X AMOSTRA)
+// -------------------------------------------------------------
+
+model ItemAtendimento {
+  id                String       @id @default(uuid())
+  atendimentoId     String
+  atendimento       Atendimento  @relation(fields: [atendimentoId], references: [id])
+  exameId           String
+  exame             Exame        @relation(fields: [exameId], references: [id])
+  amostraId         String
+  amostra           Amostra      @relation(fields: [amostraId], references: [id])
+  
+  precoCobrado      Decimal      @db.Decimal(10, 2)
+  resultadoTexto    String?      @db.Text
+  resultadoNumerico Decimal?     @db.Decimal(10, 4)
+  unidadeMedida     String?
+  valoresReferencia String?
+  observacoesLaudo  String?
+  
+  laudoLiberado     Boolean           @default(false)
+  dataHoraLiberacao DateTime?
+  liberadorId       String?
+  liberador         Usuario?          @relation("UsuarioLiberador", fields: [liberadorId], references: [id])
+  consumosReagentes ConsumoReagente[]
+
+  @@map("itens_atendimentos")
+}
+
+// -------------------------------------------------------------
+// GESTÃO DE RECOLETAS E COMUNICAÇÃO AUTOMATIZADA
+// -------------------------------------------------------------
+
+model OcorrenciaAmostra {
+  id                  String                @id @default(uuid())
+  amostraId           String
+  amostra             Amostra               @relation(fields: [amostraId], references: [id])
+  motivo              MotivoRejeicaoAmostra
+  descricaoDetalhada  String?
+  
+  // Automação da Mensagem ao Paciente
+  textoMensagemGerada String                @db.Text
+  statusNotificacao   StatusNotificacao     @default(PENDENTE)
+  dataHoraEnvio       DateTime?
+  idMensagemGateway   String?               // ID retornado pela API do WhatsApp
+  
+  custoDesperdicio    Decimal?              @db.Decimal(10, 2)
+  registradoPorId     String
+  createdAt           DateTime              @default(now())
+
+  @@map("ocorrencias_amostras")
+}
+
+// -------------------------------------------------------------
+// RASTREABILIDADE B2B (LABORATÓRIOS DE APOIO E REMESSAS)
+// -------------------------------------------------------------
+
+model LaboratorioApoio {
+  id                  String         @id @default(uuid())
+  codigoIdentificador String         @unique // ex: "DB_DIAG", "FLEURY_B2B", "PARDINI"
+  razaoSocial         String
+  nomeFantasia        String
+  cnpj                String         @unique
+  contatoResponsavel  String?
+  telefoneSuporte     String
+  emailOperacional    String
+  slaPadraoDiasUteis  Int            @default(3)
+  ativo               Boolean        @default(true)
+
+  examesConfigurados  Exame[]
+  remessas            RemessaApoio[]
+
+  @@map("laboratorios_apoio")
+}
+
+model RemessaApoio {
+  id                      String             @id @default(uuid())
+  codigoLote              String             @unique // ex: "REM-20261001-001"
+  laboratorioApoioId      String
+  laboratorioApoio        LaboratorioApoio   @relation(fields: [laboratorioApoioId], references: [id])
+  
+  dataHoraEnvio           DateTime           @default(now())
+  previsaoRetornoSla      DateTime           // Data/Hora calculada baseada no SLA
+  dataHoraRecebimento     DateTime?          // Preenchido quando o laudo/retorno do lote chega
+  statusSla               StatusSlaRemessa   @default(NO_PRAZO)
+  
+  codigoRastreioLogistica String?            // Logística fria / motoboy / transportadora
+  temperaturaEnvioGraus   Decimal?           @db.Decimal(4, 1) // ex: 4.0 °C (Cadeia de frio)
+  observacoes             String?
+  
+  amostrasRemessa         ItemRemessaApoio[]
+  
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
+
+  @@map("remessas_apoio")
+}
+
+model ItemRemessaApoio {
+  id                 String       @id @default(uuid())
+  remessaId          String
+  remessa            RemessaApoio @relation(fields: [remessaId], references: [id])
+  amostraId          String       @unique
+  amostra            Amostra      @relation(fields: [amostraId], references: [id])
+  
+  dataHoraResultado  DateTime?
+  resultadoImportado Boolean      @default(false)
+
+  @@map("itens_remessas_apoio")
+}
+
+// -------------------------------------------------------------
+// GESTÃO DE ESTOQUE, QUALIDADE E CUSTOS OPERACIONAIS (MÓDULO 5)
+// -------------------------------------------------------------
+
+model ReagenteEstoque {
+  id               String            @id @default(uuid())
+  nome             String
+  lote             String
+  dataValidade     DateTime
+  quantidadeAtual  Decimal           @db.Decimal(10, 2)
+  quantidadeMinima Decimal           @db.Decimal(10, 2)
+  custoUnitario    Decimal           @db.Decimal(10, 2)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  consumos         ConsumoReagente[]
+
+  @@map("reagentes_estoque")
+}
+
+model ConsumoReagente {
+  id                  String           @id @default(uuid())
+  exameId             String
+  exame               Exame            @relation(fields: [exameId], references: [id])
+  reagenteEstoqueId   String
+  reagenteEstoque     ReagenteEstoque  @relation(fields: [reagenteEstoqueId], references: [id])
+  quantidadeConsumida Decimal          @db.Decimal(10, 2)
+  itemAtendimentoId   String?
+  itemAtendimento     ItemAtendimento? @relation(fields: [itemAtendimentoId], references: [id])
+  dataConsumo         DateTime         @default(now())
+  createdAt           DateTime         @default(now())
+
+  @@map("consumos_reagentes")
+}
+
+model RegistroQualidade {
+  id             String   @id @default(uuid())
+  tituloPop      String   // Procedimento Operacional Padrão (POP)
+  descricaoFalha String   @db.Text
+  acaoCorretiva  String   @db.Text
+  dataRegistro   DateTime @default(now())
+  responsavelId  String   // Identificador do Responsável Técnico / Biomédico
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("registros_qualidade")
+}
+

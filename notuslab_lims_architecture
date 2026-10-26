@@ -1,0 +1,606 @@
+# NotusLab LIMS — Especificação Arquitetural e Modelagem de Domínio
+
+**Documento:** Plano Arquitetural, Estrutura de Diretórios e Modelagem Relacional  
+**Projeto:** NotusLab LIMS (Laboratory Information Management System B2B)  
+**Stack Principal:** Node.js (v20+), Express.js, Prisma ORM, PostgreSQL (Docker), React (SPA)  
+**Versão:** 1.0.0 (Fase de Planejamento)  
+
+---
+
+## 1. Visão Geral da Arquitetura de Software
+
+Para atender à criticidade operacional, rastreabilidade regulatória (RDC 786/2023 da ANVISA) e necessidade de alta disponibilidade, o backend adota uma **Arquitetura em Camadas com Separação de Preocupações (Separation of Concerns - SoC)** fundamentada em princípios de **Clean Architecture** e **Domain-Driven Design (DDD) pragmático**.
+
+### 1.1 Diagrama de Camadas e Fluxo de Requisição
+
+```mermaid
+graph TD
+    Client[React SPA Frontend] -->|HTTP / REST + JSON| Routes[1. Camada de Rotas Express]
+    Routes -->|Validação Zod / Auth Token| Middlewares[2. Middlewares: Auth, RBAC, Validate, Audit]
+    Middlewares -->|Payload Sanitizado & Tipado| Controllers[3. Controllers: Orquestração HTTP]
+    Controllers -->|Chamada a Casos de Uso DTO| Services[4. Domain Services: Regras de Negócio]
+    
+    subgraph "Core Business Logic (Domain Services)"
+        Services --> PreAnalytical[Motor Pré-Analítico: Agrupamento de Tubos]
+        Services --> Recollection[Motor de Recoleta & Alertas WhatsApp]
+        Services --> SlaTracker[Calculador de SLA & Alertas B2B]
+    end
+    
+    Services -->|Prisma Client / Transações ACID| Repositories[5. Prisma ORM / Repositories]
+    Repositories -->|Pool de Conexões| Postgres[(PostgreSQL via Docker)]
+```
+
+### 1.2 Responsabilidades por Camada
+
+1. **Camada de Rotas (`routes`):**
+   - Declaração semântica dos endpoints RESTful (`/api/v1/...`).
+   - Aplicação de middlewares de pipeline: controle de taxa (rate limiting), autenticação JWT, autorização baseada em funções (RBAC) e validação de schema de entrada.
+
+2. **Camada de Middlewares (`middlewares`):**
+   - **`auth.middleware.ts`**: Validação de token JWT e extração de contexto do usuário (id, tenant, perfil de acesso).
+   - **`rbac.middleware.ts`**: Controle granular de acesso baseado em perfis: `RECEPCAO`, `COLETADOR_FLEBOTOMISTA`, `BIOMEDICO_ANALISTA`, `RESPONSAVEL_TECNICO`, `ADMIN`.
+   - **`validate.middleware.ts`**: Interceptação e validação de `body`, `query` e `params` via **Zod**, retornando erros 422 padronizados antes de atingir o controller.
+   - **`errorHandler.middleware.ts`**: Captura centralizada de exceções (`AppError`), garantindo que falhas de banco ou internas não vazem detalhes de infraestrutura e retornem contratos padronizados.
+   - **`auditLog.middleware.ts`**: Registro imutável de ações críticas (ex: invalidação de amostra, assinatura de laudo).
+
+3. **Camada de Controladores (`controllers`):**
+   - Responsabilidade estritamente HTTP: desserializar a requisição, delegar os dados ao serviço de domínio apropriado e formatar a resposta JSON com o respectivo status code (`200 OK`, `201 Created`, `204 No Content`).
+   - Nenhum cálculo ou regra de negócio reside nos controllers.
+
+4. **Camada de Serviços / Casos de Uso (`services`):**
+   - O coração das regras de negócio do laboratório:
+     - **`PreAnalyticalEngineService`**: Dado um conjunto de exames solicitados no atendimento, calcula o menor número de tubos físicos necessários cruzando matriz biológica (soro, plasma EDTA, plasma citratado, sangue total, urina), volume mínimo e anticoagulante, indicando a ordem correta de coleta (padrão CLSI H3-A6).
+     - **`SampleRecollectionService`**: Trata a recusa técnica da amostra por hemólise, coagulação, volume insuficiente ou lipemia. Invalida o tubo atual atomicamente, gera um novo tubo de recoleta e compõe o payload formatado para notificação via WhatsApp/SMS ao paciente.
+     - **`SupportLabTrackingService`**: Orquestra envio e acompanhamento das amostras terceirizadas, calculando a previsão de retorno por dias úteis, acionando flags visuais de alerta (No Prazo, Alerta de Proximidade, Atrasado).
+   - Gerencia transações ACID usando `prisma.$transaction` para evitar inconsistências em operações compostas.
+
+5. **Camada de Dados (`prisma`):**
+   - Modelo relacional tipado de ponta a ponta gerado pelo Prisma Client.
+   - Migrations versionadas e rastreáveis.
+
+---
+
+## 2. Estrutura de Pastas do Backend (Tree)
+
+A estrutura organiza o código modularmente por domínios laboratoriais, facilitando a manutenibilidade e escalabilidade futura:
+
+```text
+backend/
+├── prisma/
+│   ├── schema.prisma              # Definição do schema relacional do banco
+│   ├── migrations/                # Histórico versionado de migrations do banco
+│   └── seed.ts                    # Carga inicial (tubos padronizados, perfis, exames-base)
+├── src/
+│   ├── @types/                    # Extensões de tipagem do Express (ex: Request.user)
+│   ├── config/                    # Configurações de ambiente tipadas e conexão
+│   │   ├── env.ts                 # Validação de variáveis de ambiente com Zod
+│   │   └── database.ts            # Singleton de inicialização do PrismaClient
+│   ├── constants/                 # Enums de domínio, mensagens padronizadas e códigos CLSI
+│   │   ├── clsi-order.constant.ts # Sequência padronizada de coleta de tubos
+│   │   └── sample-status.constant.ts
+│   ├── errors/                    # Hierarquia de tratamento de erros customizados
+│   │   ├── AppError.ts            # Classe base para erros de negócio operacionais
+│   │   ├── ValidationError.ts
+│   │   └── errorHandler.ts        # Middleware interceptor global de erros
+│   ├── middlewares/               # Middlewares transversais da aplicação
+│   │   ├── auth.middleware.ts     # Validação JWT
+│   │   ├── rbac.middleware.ts     # Proteção por função (Recepcionista, Biomédico, RT)
+│   │   ├── validate.middleware.ts # Validador de esquemas Zod
+│   │   └── audit.middleware.ts    # Auditoria de ações laboratoriais sensíveis
+│   ├── modules/                   # Módulos de domínio de negócio isolados
+│   │   ├── auth/                  # Autenticação, login e renovação de tokens
+│   │   │   ├── auth.controller.ts
+│   │   │   ├── auth.service.ts
+│   │   │   ├── auth.routes.ts
+│   │   │   └── dtos/
+│   │   ├── pacientes/             # Cadastro e gestão de pacientes
+│   │   │   ├── pacientes.controller.ts
+│   │   │   ├── pacientes.service.ts
+│   │   │   ├── pacientes.routes.ts
+│   │   │   └── dtos/
+│   │   ├── tubos-coleta/          # Catálogo mestre de tubos e aditivos
+│   │   │   ├── tubos.controller.ts
+│   │   │   ├── tubos.service.ts
+│   │   │   ├── tubos.routes.ts
+│   │   │   └── dtos/
+│   │   ├── exames/                # Catálogo de exames, mnemônicos e regras pré-analíticas
+│   │   │   ├── exames.controller.ts
+│   │   │   ├── exames.service.ts
+│   │   │   ├── exames.routes.ts
+│   │   │   └── dtos/
+│   │   ├── atendimentos/          # Protocolo/Ordem de Serviço do paciente
+│   │   │   ├── atendimentos.controller.ts
+│   │   │   ├── atendimentos.service.ts
+│   │   │   ├── atendimentos.routes.ts
+│   │   │   └── dtos/
+│   │   ├── amostras/              # Coleta, Triagem, Validação e Recoleta
+│   │   │   ├── amostras.controller.ts
+│   │   │   ├── amostras.service.ts
+│   │   │   ├── pre-analytical.service.ts # Inteligência de tubos por exame
+│   │   │   ├── recollection.service.ts   # Motor de recoleta e templates WhatsApp
+│   │   │   ├── amostras.routes.ts
+│   │   │   └── dtos/
+│   │   ├── laboratorios-apoio/    # Terceirização e controle de remessas B2B
+│   │   │   ├── apoio.controller.ts
+│   │   │   ├── apoio.service.ts
+│   │   │   ├── remessas.service.ts       # Montagem de lotes de envio
+│   │   │   ├── sla-tracker.service.ts    # Monitor e motor de alertas de prazo/SLA
+│   │   │   ├── apoio.routes.ts
+│   │   │   └── dtos/
+│   │   └── laudos/                # Digitação técnica, validação e liberação pelo RT
+│   │       ├── laudos.controller.ts
+│   │       ├── laudos.service.ts
+│   │       ├── laudos.routes.ts
+│   │       └── dtos/
+│   ├── shared/                    # Serviços compartilhados / Utilitários de infra
+│   │   ├── services/
+│   │   │   ├── notification/      # Gateway de envio WhatsApp / SMS (ex: Z-API / Twilio)
+│   │   │   │   ├── notification.interface.ts
+│   │   │   │   └── whatsapp.service.ts
+│   │   │   └── barcode/           # Gerador de identificadores únicos e etiquetas Code-128
+│   │   └── utils/
+│   │       ├── date-helpers.ts    # Cálculos de dias úteis e SLA
+│   │       └── phone-sanitizer.ts # Normalização E.164 para WhatsApp
+│   ├── app.ts                     # Instanciação do Express e registro de middlewares globais
+│   └── server.ts                  # Bootstrapping do servidor HTTP na porta configurada
+├── tests/                         # Testes automatizados (Unitários e de Integração)
+├── .env.example
+├── .gitignore
+├── Dockerfile
+├── package.json
+└── tsconfig.json
+```
+
+---
+
+## 3. Proposta de Modelagem Relacional (Prisma Schema)
+
+O esquema foi planejado para garantir:
+1. **Obrigatoriedade e normalização do contato WhatsApp do paciente.**
+2. **Definição de tubos mestre com indicação da ordem internacional de coleta (CLSI H3-A6).**
+3. **Agrupamento de múltiplos exames no mesmo tubo físico quando viável.**
+4. **Histórico e rastreabilidade total de recoletas e invalidações de amostras.**
+5. **Acompanhamento de Remessas B2B para Laboratórios de Apoio com métricas estritas de SLA.**
+
+```prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// -------------------------------------------------------------
+// ENUMS DE DOMÍNIO
+// -------------------------------------------------------------
+
+enum SexoBiologico {
+  MASCULINO
+  FEMININO
+  INDETERMINADO
+}
+
+enum StatusAtendimento {
+  REGISTRADO
+  AGUARDANDO_COLETA
+  EM_PROCESSAMENTO
+  PARCIALMENTE_LIBERADO
+  CONCLUIDO
+  CANCELADO
+}
+
+enum StatusAmostra {
+  PENDENTE_COLETA
+  COLETADA
+  EM_TRIAGEM
+  APROVADA_TRIAGEM
+  INVALIDADA_RECOLETA
+  EM_ANALISE_INTERNA
+  AGUARDANDO_ENVIO_APOIO
+  ENVIADA_APOIO
+  RESULTADO_RECEBIDO_APOIO
+  ANALISADA
+  LAUDADA_LIBERADA
+  ARQUIVADA_SOROTECA
+  DESCARTADA
+}
+
+enum MotivoRejeicaoAmostra {
+  HEMOLISE
+  COAGULACAO
+  VOLUME_INSUFICIENTE
+  LIPEMIA_ACENTUADA
+  TUBO_INADEQUADO
+  IDENTIFICACAO_ILEGIVEL
+  MATERIAL_EXTRAVIADO
+}
+
+enum StatusSlaRemessa {
+  NO_PRAZO
+  ALERTA_PROXIMIDADE
+  ATRASADO
+  CONCLUIDO
+}
+
+enum StatusNotificacao {
+  PENDENTE
+  ENVIADA
+  FALHA_ENVIO
+  CONFIRMADA_LEITURA
+}
+
+enum PerfilUsuario {
+  ADMIN
+  RECEPCAO
+  COLETADOR
+  ANALISTA_BIOMEDICO
+  RESPONSAVEL_TECNICO
+}
+
+// -------------------------------------------------------------
+// USUÁRIOS E SEGURANÇA
+// -------------------------------------------------------------
+
+model Usuario {
+  id              String         @id @default(uuid())
+  nome            String
+  email           String         @unique
+  senhaHash       String
+  perfil          PerfilUsuario
+  registroConselho String?       // CRBM, CRF, CRM
+  ativo           Boolean        @default(true)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  atendimentosCriados Atendimento[] @relation("UsuarioAtendimento")
+  coletasEfetuadas   Amostra[]     @relation("UsuarioColetador")
+  triagensEfetuadas  Amostra[]     @relation("UsuarioTriador")
+  laudosLiberados    ItemAtendimento[] @relation("UsuarioLiberador")
+}
+
+// -------------------------------------------------------------
+// PACIENTE
+// -------------------------------------------------------------
+
+model Paciente {
+  id               String         @id @default(uuid())
+  nomeCompleto     String
+  cpf              String         @unique
+  dataNascimento   DateTime
+  sexoBiologico    SexoBiologico
+  telefoneWhatsapp String         // Validação E.164 obrigatória (ex: +5511999998888)
+  email            String?
+  restricoesAlergias String?
+  observacoes      String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  atendimentos     Atendimento[]
+}
+
+// -------------------------------------------------------------
+// INTELIGÊNCIA PRÉ-ANALÍTICA: TUBOS E EXAMES
+// -------------------------------------------------------------
+
+model TuboColeta {
+  id                      String   @id @default(uuid())
+  codigo                  String   @unique // ex: "EDTA_ROXO", "CITRATO_AZUL", "SORO_GEL_AMARELO"
+  descricao               String   // ex: "Tubo Tampa Roxa - K2/K3 EDTA 4ml"
+  corTampaHex             String   // ex: "#7D3C98" (Roxo) para UI
+  aditivoAnticoagulante    String   // ex: "EDTA K3", "Citrato de Sódio 3.2%", "Fluoreto/Oxalato"
+  volumeMinimoMl          Decimal  @db.Decimal(4, 2)
+  ordemColetaRecomendada  Int      // Padrão CLSI H3-A6: 1 (Azul), 2 (Amarelo/Vermelho), 3 (Verde), 4 (Roxo), 5 (Cinza)
+  instrucoesHomogeneizacao String  // ex: "Inverter suavemente de 8 a 10 vezes"
+  ativo                   Boolean  @default(true)
+
+  examesPermitidos        Exame[]  @relation("TuboPrincipalExame")
+  amostrasGeradas         Amostra[]
+}
+
+model Exame {
+  id                        String             @id @default(uuid())
+  mnemonico                 String             @unique // ex: "HEMO", "GLI", "COAG", "HIV_EIA"
+  codigoTUSS                String?
+  nome                      String
+  setorLaboratorial         String             // ex: "Hematologia", "Bioquímica", "Sorologia"
+  tempoJejumHoras           Int                @default(0)
+  orientacoesPreparo        String?
+  prazoDiasUteis            Int                @default(1)
+  
+  // Relação Pré-Analítica Obrigatória com o Tubo
+  tuboColetaId              String
+  tuboColeta                TuboColeta         @relation("TuboPrincipalExame", fields: [tuboColetaId], references: [id])
+  
+  // Regra de Terceirização / Laboratório de Apoio
+  requerApoioExterno        Boolean            @default(false)
+  laboratorioApoioPadraoId  String?
+  laboratorioApoioPadrao    LaboratorioApoio?  @relation(fields: [laboratorioApoioPadraoId], references: [id])
+
+  itensAtendimentos         ItemAtendimento[]
+}
+
+// -------------------------------------------------------------
+// ATENDIMENTO (ORDEM DE SERVIÇO)
+// -------------------------------------------------------------
+
+model Atendimento {
+  id                 String             @id @default(uuid())
+  codigoProtocolo    String             @unique // ex: "ATD-2026-000452"
+  pacienteId         String
+  paciente           Paciente           @relation(fields: [pacienteId], references: [id])
+  usuarioRegistroId  String
+  usuarioRegistro    Usuario            @relation("UsuarioAtendimento", fields: [usuarioRegistroId], references: [id])
+  
+  medicoSolicitante  String?
+  crmMedico          String?
+  status             StatusAtendimento  @default(REGISTRADO)
+  dataHoraEntrada    DateTime           @default(now())
+  observacoes        String?
+  
+  amostras           Amostra[]
+  itens              ItemAtendimento[]
+
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+}
+
+// -------------------------------------------------------------
+// AMOSTRA (TUBO FÍSICO COM CÓDIGO DE BARRAS)
+// -------------------------------------------------------------
+
+model Amostra {
+  id                     String            @id @default(uuid())
+  codigoBarras           String            @unique // ex: "AMO-20261001-99881"
+  atendimentoId          String
+  atendimento            Atendimento       @relation(fields: [atendimentoId], references: [id])
+  
+  tuboColetaId           String
+  tuboColeta             TuboColeta        @relation(fields: [tuboColetaId], references: [id])
+  
+  status                 StatusAmostra     @default(PENDENTE_COLETA)
+  
+  // Metadados de Coleta
+  dataHoraColeta         DateTime?
+  coletadorId            String?
+  coletador              Usuario?          @relation("UsuarioColetador", fields: [coletadorId], references: [id])
+  
+  // Metadados de Triagem
+  dataHoraTriagem        DateTime?
+  triadorId              String?
+  triador                Usuario?          @relation("UsuarioTriador", fields: [triadorId], references: [id])
+  
+  // Regra de Rastreabilidade de Recoleta
+  isRecoleta             Boolean           @default(false)
+  amostraOriginalId      String?
+  amostraOriginal        Amostra?          @relation("HistoricoRecoleta", fields: [amostraOriginalId], references: [id])
+  amostrasSubstitutas    Amostra[]         @relation("HistoricoRecoleta")
+  
+  // Rastreabilidade B2B
+  itemRemessaApoio       ItemRemessaApoio?
+  ocorrencias            OcorrenciaAmostra[]
+  itensExames            ItemAtendimento[]
+
+  createdAt              DateTime          @default(now())
+  updatedAt              DateTime          @updatedAt
+}
+
+// -------------------------------------------------------------
+// ITEM DO ATENDIMENTO (ASSOCIAÇÃO EXAME X AMOSTRA)
+// -------------------------------------------------------------
+
+model ItemAtendimento {
+  id                   String        @id @default(uuid())
+  atendimentoId        String
+  atendimento          Atendimento   @relation(fields: [atendimentoId], references: [id])
+  exameId              String
+  exame                Exame         @relation(fields: [exameId], references: [id])
+  amostraId            String
+  amostra              Amostra       @relation(fields: [amostraId], references: [id])
+  
+  resultadoTexto       String?       @db.Text
+  resultadoNumerico    Decimal?      @db.Decimal(10, 4)
+  unidadeMedida        String?
+  valoresReferencia    String?
+  observacoesLaudo     String?
+  
+  laudoLiberado        Boolean       @default(false)
+  dataHoraLiberacao    DateTime?
+  liberadorId          String?
+  liberador            Usuario?      @relation("UsuarioLiberador", fields: [liberadorId], references: [id])
+}
+
+// -------------------------------------------------------------
+// GESTÃO DE RECOLETAS E COMUNICAÇÃO AUTOMATIZADA
+// -------------------------------------------------------------
+
+model OcorrenciaAmostra {
+  id                    String                @id @default(uuid())
+  amostraId             String
+  amostra               Amostra               @relation(fields: [amostraId], references: [id])
+  motivo                MotivoRejeicaoAmostra
+  descricaoDetalhada    String?
+  
+  // Automação da Mensagem ao Paciente
+  textoMensagemGerada   String                @db.Text
+  statusNotificacao     StatusNotificacao     @default(PENDENTE)
+  dataHoraEnvio         DateTime?
+  idMensagemGateway     String?               // ID retornado pela API do WhatsApp
+  
+  registradoPorId       String
+  createdAt             DateTime              @default(now())
+}
+
+// -------------------------------------------------------------
+// RASTREABILIDADE B2B (LABORATÓRIOS DE APOIO E REMESSAS)
+// -------------------------------------------------------------
+
+model LaboratorioApoio {
+  id                  String             @id @default(uuid())
+  codigoIdentificador String             @unique // ex: "PARDINI", "FLEURY_B2B", "DB_DIAG"
+  razaoSocial         String
+  nomeFantasia        String
+  cnpj                String             @unique
+  contatoResponsavel  String?
+  telefoneSuporte     String
+  emailOperacional    String
+  slaPadraoDiasUteis  Int                @default(3)
+  ativo               Boolean            @default(true)
+
+  examesConfigurados  Exame[]
+  remessas            RemessaApoio[]
+}
+
+model RemessaApoio {
+  id                      String            @id @default(uuid())
+  codigoLote              String            @unique // ex: "REM-20261001-001"
+  laboratorioApoioId      String
+  laboratorioApoio        LaboratorioApoio  @relation(fields: [laboratorioApoioId], references: [id])
+  
+  dataHoraEnvio           DateTime          @default(now())
+  previsaoRetornoSla      DateTime          // Data/Hora calculada baseada no SLA
+  dataHoraRecebimento     DateTime?         // Preenchido quando o laudo/retorno do lote chega
+  statusSla               StatusSlaRemessa  @default(NO_PRAZO)
+  
+  codigoRastreioLogistica String?           // Logística fria / motoboy / transportadora
+  temperaturaEnvioGraus   Decimal?          @db.Decimal(4, 1) // ex: 4.0 °C (Cadeia de frio)
+  observacoes             String?
+  
+  amostrasRemessa         ItemRemessaApoio[]
+  
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+}
+
+model ItemRemessaApoio {
+  id                 String       @id @default(uuid())
+  remessaId          String
+  remessa            RemessaApoio @relation(fields: [remessaId], references: [id])
+  amostraId          String       @unique
+  amostra            Amostra      @relation(fields: [amostraId], references: [id])
+  
+  dataHoraResultado  DateTime?
+  resultadoImportado Boolean      @default(false)
+}
+```
+
+---
+
+## 4. Ciclo de Vida e Fluxo de Estado (Status) da Amostra
+
+O fluxo de estados garante a rastreabilidade total de acordo com as boas práticas laboratoriais (RDC 786/2023), isolando a fase pré-analítica, analítica e pós-analítica, com ramificação dedicada para terceirização e para a sub-rotina de recoleta.
+
+### 4.1 Máquina de Estados da Amostra
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDENTE_COLETA: Atendimento Criado (Tubo Definido pelo Sistema)
+    
+    PENDENTE_COLETA --> COLETADA: Flebotomista bipou o tubo e confirmou coleta
+    
+    COLETADA --> EM_TRIAGEM: Recepção no setor de triagem/centrifugação
+    
+    state EM_TRIAGEM {
+        [*] --> VerificacaoFisica
+        VerificacaoFisica --> AvaliacaoVolume
+        AvaliacaoVolume --> InspecaoFibrinaHemolise
+    }
+    
+    EM_TRIAGEM --> INVALIDADA_RECOLETA: Reprovada (Hemólise / Coagulação / Volume)
+    
+    state INVALIDADA_RECOLETA {
+        [*] --> InvalidaTuboAtual
+        InvalidaTuboAtual --> DisparaAlertaWhatsApp
+        DisparaAlertaWhatsApp --> CriaNovaAmostraRecoleta
+    }
+    
+    CriaNovaAmostraRecoleta --> PENDENTE_COLETA: Amostra Substituta vinculada
+    
+    EM_TRIAGEM --> APROVADA_TRIAGEM: Aprovada na Inspeção
+    
+    state DecisaoDestino <<choice>>
+    APROVADA_TRIAGEM --> DecisaoDestino
+    
+    DecisaoDestino --> EM_ANALISE_INTERNA: Exame Local
+    DecisaoDestino --> AGUARDANDO_ENVIO_APOIO: Exame Terceirizado
+    
+    AGUARDANDO_ENVIO_APOIO --> ENVIADA_APOIO: Agrupada em Lote/Remessa (Início SLA)
+    
+    ENVIADA_APOIO --> RESULTADO_RECEBIDO_APOIO: Laudo/Interfaceamento do Apoio Recebido
+    RESULTADO_RECEBIDO_APOIO --> ANALISADA
+    
+    EM_ANALISE_INTERNA --> ANALISADA: Equipamento/Biomédico digitou resultado
+    
+    ANALISADA --> LAUDADA_LIBERADA: Responsável Técnico (RT) assinou digitalmente
+    
+    LAUDADA_LIBERADA --> ARQUIVADA_SOROTECA: Amostra mantida em temperatura regulamentar
+    ARQUIVADA_SOROTECA --> DESCARTADA: Término do tempo de guarda (Descarte biológico)
+    DESCARTADA --> [*]
+```
+
+### 4.2 Detalhamento de Transições e Regras Específicas
+
+| Status Origem | Status Destino | Gatilho / Ação do Sistema | Validações e Efeitos Colaterais |
+| :--- | :--- | :--- | :--- |
+| **`PENDENTE_COLETA`** | `COLETADA` | Técnico bipeia o código de barras da etiqueta gerada na sala de coleta. | Valida se o tubo utilizado é o mesmo cadastrado pelo motor pré-analítico. Registra `coletadorId` e timestamp. |
+| **`COLETADA`** | `EM_TRIAGEM` | Recebimento físico na área de triagem/área técnica. | Inicia o temporizador de estabilidade da amostra (ex: tempo máximo até centrifugação). |
+| **`EM_TRIAGEM`** | `INVALIDADA_RECOLETA` | Triador identifica hemólise, fibrina, volume inferior ao `volumeMinimoMl` ou tubo errado. | **Gatilho de Recoleta:** 1. Altera status da amostra atual para `INVALIDADA_RECOLETA`. 2. Cria registro em `OcorrenciaAmostra`. 3. Dispara mensagem padronizada no WhatsApp do paciente (solicitando retorno). 4. Cria automaticamente nova amostra filha em `PENDENTE_COLETA`. |
+| **`EM_TRIAGEM`** | `APROVADA_TRIAGEM` | Amostra íntegra e sem interferentes pré-analíticos. | Direciona para bancada interna ou fila de remessa de apoio. |
+| **`APROVADA_TRIAGEM`** | `AGUARDANDO_ENVIO_APOIO` | Identificação de que o exame associado possui `requerApoioExterno = true`. | Adiciona a amostra na esteira de montagem de lote/remessa com controle térmico (refrigerado/congelado). |
+| **`AGUARDANDO_ENVIO_APOIO`** | `ENVIADA_APOIO` | Despacho da remessa para o laboratório parceiro. | **Gatilho de SLA B2B:** Calcula a `previsaoRetornoSla` baseada nos dias úteis do apoio. Ativa monitor de alertas visuais (Verde / Amarelo / Vermelho). |
+| **`ENVIADA_APOIO`** | `RESULTADO_RECEBIDO_APOIO` | Importação de resultado via interfaceamento/arquivo ou digitação do retorno externo. | Registra data de chegada real e audita cumprimento do SLA do laboratório de apoio. |
+| **`EM_ANALISE_INTERNA`** | `ANALISADA` | Inserção dos dados técnicos e valores de referência. | Alerta automático de valores críticos (pânico) para contato imediato caso configurado. |
+| **`ANALISADA`** | `LAUDADA_LIBERADA` | Assinatura pelo Responsável Técnico (CRBM/CRF/CRM). | Bloqueia edição do resultado. Disponibiliza para impressão/visualização pelo paciente. |
+| **`LAUDADA_LIBERADA`** | `ARQUIVADA_SOROTECA` | Amostra movida para rack/estante de soroteca refrigerada. | Rastreabilidade do rack/gaveta para eventuais contestações ou reanálises. |
+| **`ARQUIVADA_SOROTECA`** | `DESCARTADA` | Vencimento do prazo regulatório de soroteca. | Registro para manifesto de descarte de resíduos biológicos infectantes (PGRSS). |
+
+---
+
+## 5. Implementação das 3 Dores Críticas de Negócio
+
+### 5.1 Dor 1: Inteligência Pré-Analítica (Motor de Tubos)
+- **Problema:** Erro humano ao coletar hemograma em tubo com heparina ou soro em tubo citratado, gerando recusa técnica e desgaste com o paciente.
+- **Solução Arquitetural:**
+  - O operador **não seleciona o tubo**. Ao selecionar os exames no atendimento (ex: Hemograma + Glicemia + Coagulograma), o serviço `PreAnalyticalEngineService` roda um algoritmo determinístico:
+    1. Agrupa exames compatíveis que compartilham o mesmo anticoagulante e matriz (ex: Glicemia e Ureia -> Soro Gel Amarelo).
+    2. Garante que exames incompatíveis (ex: Hemograma -> EDTA Roxo; Coagulograma -> Citrato Azul) recebam tubos físicos distintos.
+    3. Soma os volumes mínimos necessários e valida se um tubo comporta todos os exames agrupados.
+    4. Gera as etiquetas de código de barras já ordenadas de acordo com a norma internacional **CLSI H3-A6** para evitar contaminação cruzada de aditivos pela agulha:
+       - 1º: Tubo de Citrato (Azul)
+       - 2º: Tubo de Soro com Ativador/Gel (Vermelho ou Amarelo)
+       - 3º: Tubo de Heparina (Verde)
+       - 4º: Tubo de EDTA (Roxo)
+       - 5º: Tubo de Fluoreto (Cinza)
+
+### 5.2 Dor 2: Comunicação Automatizada de Recoleta
+- **Problema:** Demora em avisar o paciente sobre amostra coagulada/inadequada, atrasando o diagnóstico e gerando insatisfação.
+- **Solução Arquitetural:**
+  - Cadastro de Paciente valida número de celular/WhatsApp em formato internacional E.164 com bloqueio se inválido.
+  - Ao registrar recusa na triagem (`RecollectionService`):
+    1. A amostra reprovada é marcada como `INVALIDADA_RECOLETA` com o respectivo motivo técnico (`COAGULACAO`, `HEMOLISE`, etc.).
+    2. O sistema gera uma nova amostra no status `PENDENTE_COLETA` vinculada ao mesmo atendimento com a flag `isRecoleta = true`.
+    3. Gera automaticamente o texto humanizado e profissional para o WhatsApp:
+       > *"Olá, {{nomePaciente}}. Identificamos que para garantir a máxima precisão do seu exame de {{nomeExame}}, será necessário realizar uma nova coleta de rotina no NotusLab (Protocolo: {{codigoProtocolo}}). Por favor, compareça à nossa unidade em jejum até às 11h. Qualquer dúvida estamos à disposição."*
+    4. Envia o webhook para a fila de mensageria com registro de status em `OcorrenciaAmostra`.
+
+### 5.3 Dor 3: Rastreabilidade B2B e Monitoramento de SLA
+- **Problema:** Amostras enviadas para laboratórios de apoio ficam em um "buraco negro", extrapolando prazos de laudo sem que a equipe interna perceba antes do paciente reclamar.
+- **Solução Arquitetural:**
+  - O `SupportLabTrackingService` agrupa amostras em remessas (`RemessaApoio`).
+  - Ao expedir a remessa, calcula a `previsaoRetornoSla` considerando o calendário de dias úteis e feriados.
+  - O sistema provê uma métrica de SLA calculada em tempo real com semáforo visual para o frontend React:
+    - **Verde (`NO_PRAZO`)**: Tempo decorrido < 75% do SLA total.
+    - **Amarelo (`ALERTA_PROXIMIDADE`)**: Tempo decorrido entre 75% e 100% do SLA.
+    - **Vermelho (`ATRASADO`)**: Tempo decorrido > 100% do SLA sem recebimento do resultado.
+  - Permite emissão de relatórios de cobrança de fornecedores com evidência de quebra de contrato/SLA.
+
+---
+
+## 6. Próximos Passos Recomendados para Execução
+
+1. **Aprovação do Plano Arquitetural pelos Stakeholders.**
+2. **Geração do `docker-compose.yml`** (PostgreSQL 16 com volume persistente e Healthcheck).
+3. **Criação do arquivo `schema.prisma`** e execução da primeira migration.
+4. **Criação do script de seed** com a tabela de tubos padrão (CLSI) e catálogo mestre de exames.
+5. **Configuração da estrutura base do Node.js com TypeScript e Express.**
