@@ -2,10 +2,10 @@
 
 > **Projeto Final de Laboratório de Programação**  
 > **Professor:** Willen Leolatto Carneiro  
-> **Instituição de Ensino Superior:** Ciência da Computação / Engenharia de Software  
+> **Instituição de Ensino Superior:** Ciência da Computação 
 > **Equipe (Trabalho em Dupla):**  
-> - **Aluno 1:** Bruno e Integrante da Dupla <!-- Preencha com os nomes e RAs da dupla -->
-> - **Aluno 2:** Integrante da Dupla  
+> - **Aluno 1:** Bruno da Silva Lima
+> - **Aluno 2:** Cauan Costa  
 
 ---
 
